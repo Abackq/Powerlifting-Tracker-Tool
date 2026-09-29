@@ -18,7 +18,6 @@ DATE_FORMATS = ["%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%B %d, %Y"]
 #                 print(f"row={cell.row}, col={cell.column}, value={cell.value!r}")
 
 # region Stage 1: Loading
-
 def load_client_workbook(filepath: str):
     workbook = load_workbook(filepath, read_only=False, data_only=True)
     return workbook
@@ -178,7 +177,7 @@ def extract_day_exercises(sheet, week: dict, day: dict) -> list[dict]:
         exercises.append(exercise)
     return exercises
 
-def extract_all_exercises(workbook, all_blocks: list[dict]) -> list[dict]:
+def extract_all_exercises(workbook, all_blocks: list[dict], client_id) -> list[dict]:
     """Walks every block -> week -> day, calls extract_day_exercises for each,
     and flattens the results into one single list of raw exercise rows."""
     all_raw_rows = []
@@ -189,6 +188,7 @@ def extract_all_exercises(workbook, all_blocks: list[dict]) -> list[dict]:
                 rows = extract_day_exercises(sheet, week, day)
                 for row in rows:
                     row["block_number"] = block["block_number"]
+                    row["client_id"] = client_id
                 all_raw_rows.extend(rows)
     return all_raw_rows
 
@@ -224,6 +224,7 @@ def process_exercise_row(raw_row: dict) -> dict:
     actual_rpe = validate_numeric_field(raw_row["actual_rpe_raw"], "actual_rpe")
 
     return {
+        "client_id": raw_row["client_id"],
         "block_number": raw_row["block_number"],
         "week_number": raw_row["week_number"],
         "day_number": raw_row["day_number"],
@@ -249,8 +250,11 @@ def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict]]
             clean_records.append(clean)
         except ValueError as e:
             rejected_records.append({
-                "raw_row": raw_row,
-                "reason": str(e),
+                "client_id": raw_row["client_id"],
+                "block_number": raw_row["block_number"],
+                "week_number": raw_row["week_number"],
+                "day_number": raw_row["day_number"],
+                "rejection_reason": str(e)
             })
 
     return clean_records, rejected_records
@@ -304,6 +308,7 @@ def find_short_weeks(all_blocks: list[dict], expected_days: int = 4) -> None:
             day_count = len(week["days"])
             if day_count != expected_days:
                 print(block["block_number"], block["tab_name"], "week", week["week_number"], "-", day_count, "days")
+
 def compute_week_date_ranges(all_blocks: list[dict]) -> None:
     """Attaches week_start date and week_end_date to each week, using the block's
     start date and the week's position within its block."""
@@ -316,14 +321,22 @@ def compute_week_date_ranges(all_blocks: list[dict]) -> None:
 # endregion Stage 5: Date Derivation
 
 if __name__ == "__main__":
+    client_id = "paste-jons-actual-client-uuid-here"  # from the clients table in Supabase
     wb = load_client_workbook("Jon Program.xlsx")
     all_blocks = build_all_blocks(wb)
     compute_block_start_dates(all_blocks, find_date_started(wb))
     compute_week_date_ranges(all_blocks)
-    raw_rows = extract_all_exercises(wb, all_blocks)
+    raw_rows = extract_all_exercises(wb, all_blocks, client_id)
     clean, rejected = process_all_exercises(raw_rows)
     print(f"{len(clean)} clean, {len(rejected)} rejected")
-    print(all_blocks[0]["weeks"][0])
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # all_blocks = build_all_blocks(wb)
+    # compute_block_start_dates(all_blocks, find_date_started(wb))
+    # compute_week_date_ranges(all_blocks)
+    # raw_rows = extract_all_exercises(wb, all_blocks)
+    # clean, rejected = process_all_exercises(raw_rows)
+    # print(f"{len(clean)} clean, {len(rejected)} rejected")
+    # print(all_blocks[0]["weeks"][0])
     # wb = load_client_workbook("Jon Program.xlsx")
     # all_blocks = build_all_blocks(wb)
     # print(all_blocks[8])
