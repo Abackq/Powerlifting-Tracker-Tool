@@ -1,9 +1,12 @@
 from openpyxl import load_workbook
 import re
 import time
+from datetime import datetime, date
+from datetime import timedelta
 
-WEEK_PATTERN = re.compile(r"Week\s+(\d+)$", re.IGNORECASE)
+WEEK_PATTERN = re.compile(r"^(?:Week\s+(\d+)|Meet\s+Week)$", re.IGNORECASE)
 DAY_PATTERN = re.compile(r"Day\s+(\d+)$", re.IGNORECASE)
+DATE_FORMATS = ["%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%B %d, %Y"]
 
 # def print_sheet_grid(workbook, sheet_name: str):
 #     """Prints every non-empty cell's row, column, and value for a given sheet.
@@ -20,9 +23,21 @@ def load_client_workbook(filepath: str):
     workbook = load_workbook(filepath, read_only=False, data_only=True)
     return workbook
 
+def split_tabs(workbook, metadata_tab_name: str = "READ ME"):
+    """Partitions a workbook's tabs into (metadata_sheet, block_tab_names).
+    metadata_sheet is None if no matching tab exists; the caller decides whether that's an error."""
+    metadata_sheet = None
+    block_tabs = []
+    for name in workbook.sheetnames:
+        if name.strip() == metadata_tab_name.strip():
+            metadata_sheet = workbook[name]
+        else:
+            block_tabs.append(name)
+    return metadata_sheet, block_tabs
+
 def get_block_tabs(workbook, metadata_tab_name: str = "READ ME") -> list[str]:
     "Returns tab names in order, excluding metadata tabs, preserving order for block numbering"
-    return [name for name in workbook.sheetnames if name != metadata_tab_name]
+    return split_tabs(workbook, metadata_tab_name)[1]
 
 # endregion Stage 1: Loading
 
@@ -35,8 +50,10 @@ def find_week_columns(sheet) -> list[dict]:
             if isinstance(cell.value, str):
                 match = WEEK_PATTERN.match(cell.value.strip())
                 if match:
+                    is_meet_week = match.group(1) is None
                     weeks.append({
-                        "week_number": int(match.group(1)),
+                        "week_number": len(weeks) + 1 if is_meet_week else int(match.group(1)),
+                        "is_meet_week": is_meet_week,
                         "row": cell.row,
                         "start_column": cell.column
                     })
@@ -240,23 +257,107 @@ def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict]]
 
 # endregion Stage 4: Validation
 
+# region Stage 5: Date Derivation
+def find_date_started(workbook) -> date:
+    """Finds the 'Date Started' label on the metadata tab and returns the date
+    in the cell immediately to its right. Raises ValueError if it can't be found or parsed."""
+    metadata_sheet, _ = split_tabs(workbook)
+    if metadata_sheet is None:
+        raise ValueError("metadata tab not found")
+
+    for row in metadata_sheet.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.strip().lower().startswith("date started"):
+                value = metadata_sheet.cell(row=cell.row, column=cell.column + 1).value
+                return parse_date_value(value)
+
+    raise ValueError("'Date Started' label not found on metadata tab")
+
+def parse_date_value(value) -> date:
+    """Converts a cell value into a date, handling real Excel dates and date-like text."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        for fmt in DATE_FORMATS:
+            try:
+                return datetime.strptime(value.strip(), fmt).date()
+            except ValueError:
+                continue
+    raise ValueError(f"could not parse date from: {value!r}")
+
+def compute_block_start_dates(all_blocks: list[dict], date_started: date) -> None:
+    """Attaches 'start_date' to each block. Blocks run back-to-back in whole
+    Mon-Sun weeks, so each block starts (weeks in previous block) * 7 days after the last."""
+    if date_started.weekday() != 0:  # weekday() returns 0 for Monday
+        raise ValueError(f"Date Started {date_started} is not a Monday")
+
+    block_start = date_started
+    for block in all_blocks:
+        block["start_date"] = block_start
+        block_length_weeks = max((w["week_number"] for w in block["weeks"]), default=0)
+        block_start += timedelta(weeks=block_length_weeks)
+
+def find_short_weeks(all_blocks: list[dict], expected_days: int = 4) -> None:
+    """Prints every week whose day count differs from expected_days."""
+    for block in all_blocks:
+        for week in block["weeks"]:
+            day_count = len(week["days"])
+            if day_count != expected_days:
+                print(block["block_number"], block["tab_name"], "week", week["week_number"], "-", day_count, "days")
+def compute_week_date_ranges(all_blocks: list[dict]) -> None:
+    """Attaches week_start date and week_end_date to each week, using the block's
+    start date and the week's position within its block."""
+    for block in all_blocks:
+        for week in block["weeks"]:
+            week_start = block["start_date"] + timedelta(weeks=week["week_number"] - 1)
+            week["week_start_date"] = week_start
+            week["week_end_date"] = week_start + timedelta(days=6)
+
+# endregion Stage 5: Date Derivation
 
 if __name__ == "__main__":
-    t0 = time.time()
     wb = load_client_workbook("Jon Program.xlsx")
-    t1 = time.time()
     all_blocks = build_all_blocks(wb)
-    t2 = time.time()
+    compute_block_start_dates(all_blocks, find_date_started(wb))
+    compute_week_date_ranges(all_blocks)
     raw_rows = extract_all_exercises(wb, all_blocks)
-    t3 = time.time()
     clean, rejected = process_all_exercises(raw_rows)
-    t4 = time.time()
-
     print(f"{len(clean)} clean, {len(rejected)} rejected")
-    print(f"Load:      {t1 - t0:.2f}s")
-    print(f"Structure: {t2 - t1:.2f}s")
-    print(f"Extract:   {t3 - t2:.2f}s")
-    print(f"Validate:  {t4 - t3:.2f}s")
+    print(all_blocks[0]["weeks"][0])
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # all_blocks = build_all_blocks(wb)
+    # print(all_blocks[8])
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # all_blocks = build_all_blocks(wb)
+    # for block in all_blocks:
+    #     day_counts = [len(w["days"]) for w in block["weeks"]]
+    #     print(block["block_number"], block["tab_name"], day_counts)
+
+    # find_short_weeks(all_blocks)
+    # compute_block_start_dates(all_blocks, find_date_started(wb))
+    # compute_day_dates(all_blocks)
+    # for block in all_blocks[:3]:
+    #     print(block["block_number"], block["tab_name"], block["start_date"])
+    # print(all_blocks[0]["weeks"][0]["days"])
+
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # print(find_date_started(wb))
+
+    # t0 = time.time()
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # t1 = time.time()
+    # all_blocks = build_all_blocks(wb)
+    # t2 = time.time()
+    # raw_rows = extract_all_exercises(wb, all_blocks)
+    # t3 = time.time()
+    # clean, rejected = process_all_exercises(raw_rows)
+    # t4 = time.time()
+
+    # print(f"{len(clean)} clean, {len(rejected)} rejected")
+    # print(f"Load:      {t1 - t0:.2f}s")
+    # print(f"Structure: {t2 - t1:.2f}s")
+    # print(f"Extract:   {t3 - t2:.2f}s")
+    # print(f"Validate:  {t4 - t3:.2f}s")
 
     # start = time.time()
 
