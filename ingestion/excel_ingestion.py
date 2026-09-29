@@ -4,12 +4,9 @@ import time
 from datetime import datetime, date
 from datetime import timedelta
 
-WEEK_PATTERN = re.compile(r"Week\s+(\d+)$", re.IGNORECASE)
+WEEK_PATTERN = re.compile(r"^(?:Week\s+(\d+)|Meet\s+Week)$", re.IGNORECASE)
 DAY_PATTERN = re.compile(r"Day\s+(\d+)$", re.IGNORECASE)
 DATE_FORMATS = ["%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%B %d, %Y"]
-# Day N -> days after that week's Monday (weeks run Mon-Sun).
-# Day 5 is Sunday, the 7th day, so its offset is 6.
-DAY_OFFSETS = {1: 0, 2: 1, 3: 3, 4: 5, 5: 6}
 
 # def print_sheet_grid(workbook, sheet_name: str):
 #     """Prints every non-empty cell's row, column, and value for a given sheet.
@@ -53,8 +50,10 @@ def find_week_columns(sheet) -> list[dict]:
             if isinstance(cell.value, str):
                 match = WEEK_PATTERN.match(cell.value.strip())
                 if match:
+                    is_meet_week = match.group(1) is None
                     weeks.append({
-                        "week_number": int(match.group(1)),
+                        "week_number": len(weeks) + 1 if is_meet_week else int(match.group(1)),
+                        "is_meet_week": is_meet_week,
                         "row": cell.row,
                         "start_column": cell.column
                     })
@@ -298,18 +297,6 @@ def compute_block_start_dates(all_blocks: list[dict], date_started: date) -> Non
         block_length_weeks = max((w["week_number"] for w in block["weeks"]), default=0)
         block_start += timedelta(weeks=block_length_weeks)
 
-def compute_day_dates(all_blocks: list[dict]) -> None:
-    """Attaches 'date' to every day, using its block's start date, its week number,
-    and its Day N offset within the week."""
-    for block in all_blocks:
-        for week in block["weeks"]:
-            week_monday = block["start_date"] + timedelta(weeks=week["week_number"] - 1)
-            for day in week["days"]:
-                offset = DAY_OFFSETS.get(day["day_number"])
-                if offset is None:
-                    raise ValueError(f"no weekday mapping for Day {day['day_number']}")
-                day["date"] = week_monday + timedelta(days=offset)
-
 def find_short_weeks(all_blocks: list[dict], expected_days: int = 4) -> None:
     """Prints every week whose day count differs from expected_days."""
     for block in all_blocks:
@@ -317,14 +304,34 @@ def find_short_weeks(all_blocks: list[dict], expected_days: int = 4) -> None:
             day_count = len(week["days"])
             if day_count != expected_days:
                 print(block["block_number"], block["tab_name"], "week", week["week_number"], "-", day_count, "days")
+def compute_week_date_ranges(all_blocks: list[dict]) -> None:
+    """Attaches week_start date and week_end_date to each week, using the block's
+    start date and the week's position within its block."""
+    for block in all_blocks:
+        for week in block["weeks"]:
+            week_start = block["start_date"] + timedelta(weeks=week["week_number"] - 1)
+            week["week_start_date"] = week_start
+            week["week_end_date"] = week_start + timedelta(days=6)
+
 # endregion Stage 5: Date Derivation
 
 if __name__ == "__main__":
     wb = load_client_workbook("Jon Program.xlsx")
     all_blocks = build_all_blocks(wb)
-    for block in all_blocks:
-        day_counts = [len(w["days"]) for w in block["weeks"]]
-        print(block["block_number"], block["tab_name"], day_counts)
+    compute_block_start_dates(all_blocks, find_date_started(wb))
+    compute_week_date_ranges(all_blocks)
+    raw_rows = extract_all_exercises(wb, all_blocks)
+    clean, rejected = process_all_exercises(raw_rows)
+    print(f"{len(clean)} clean, {len(rejected)} rejected")
+    print(all_blocks[0]["weeks"][0])
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # all_blocks = build_all_blocks(wb)
+    # print(all_blocks[8])
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # all_blocks = build_all_blocks(wb)
+    # for block in all_blocks:
+    #     day_counts = [len(w["days"]) for w in block["weeks"]]
+    #     print(block["block_number"], block["tab_name"], day_counts)
 
     # find_short_weeks(all_blocks)
     # compute_block_start_dates(all_blocks, find_date_started(wb))
