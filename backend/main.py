@@ -5,6 +5,7 @@ from uuid import UUID
 from supabase import create_client, Client
 from pathlib import Path
 from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 import os
 from fastapi import HTTPException
 
@@ -14,6 +15,11 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
+
+# Get health status of the API
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 class SetInput(BaseModel):
     set_number: int
@@ -25,8 +31,8 @@ class SetInput(BaseModel):
     notes: str | None = None
 
 class ExerciseInput(BaseModel):
-    exercise_id: str
-    exercise_role: str
+    exercise_name: str
+    exercise_role: str | None = None
     sets: list[SetInput]
 
 class SessionInput(BaseModel):
@@ -36,21 +42,40 @@ class SessionInput(BaseModel):
     day_number: int | None = None
     exercises: list[ExerciseInput]
 
+class ProgramWeekInput(BaseModel):
+    client_id: UUID
+    block: int
+    week: int
+    week_start_date: date
+    week_end_date: date
+
 def get_exercise_id(exercise_name: str) -> UUID | None:
-    result = supabase.table("exercises").select("id").eq("name", exercise_name).execute()
+    result = supabase.table("exercises").select("id").ilike("name", exercise_name.strip()).execute()
     if result.data:
         return result.data[0]["id"]
     return None
 
 @app.post("/sessions")
 def create_session(session: SessionInput):
-    session_result = supabase.table("sessions").insert({
-        "client_id": str(session.client_id),
-        "present_date": session.present_date.isoformat() if session.present_date else None,
-        "program_week_id": str(session.program_week_id) if session.program_week_id else None,
-        "day_number": session.day_number
-    }).execute()
-    session_id = session_result.data[0]["id"]
+    if session.program_week_id is None:
+        raise HTTPException(status_code=422, detail="program_week_id is required")
+
+    existing = supabase.table("sessions").select("id") \
+        .eq("client_id", str(session.client_id)) \
+        .eq("program_week_id", str(session.program_week_id)) \
+        .eq("day_number", session.day_number) \
+        .execute()
+
+    if existing.data:
+        session_id = existing.data[0]["id"]
+    else:
+        session_result = supabase.table("sessions").insert({
+            "client_id": str(session.client_id),
+            "present_date": session.present_date.isoformat() if session.present_date else None,
+            "program_week_id": str(session.program_week_id),
+            "day_number": session.day_number
+        }).execute()
+        session_id = session_result.data[0]["id"]
 
     rejected_exercises = []
     for exercise in session.exercises:
@@ -59,12 +84,20 @@ def create_session(session: SessionInput):
             rejected_exercises.append({"exercise_name": exercise.exercise_name, "reason": "Exercise not found"})
             continue
 
-        se_result = supabase.table("session_exercises").insert({
-            "session_id": session_id,
-            "exercise_id": exercise_id,
-            "exercise_role": exercise.exercise_role
-        }).execute()
-        session_exercise_id = se_result.data[0]["id"]
+        existing_se = supabase.table("session_exercises").select("id") \
+            .eq("session_id", session_id) \
+            .eq("exercise_id", exercise_id) \
+            .execute()
+        
+        if existing_se.data:
+            session_exercise_id = existing_se.data[0]["id"]
+        else:
+            se_result = supabase.table("session_exercises").insert({
+                "session_id": session_id,
+                "exercise_id": exercise_id,
+                "exercise_role": exercise.exercise_role
+            }).execute()
+            session_exercise_id = se_result.data[0]["id"]
 
         for s in exercise.sets:
             supabase.table("training_log").insert({
@@ -78,6 +111,27 @@ def create_session(session: SessionInput):
                 "notes": s.notes
             }).execute()
 
-        return{"session_id": session_id, "rejected_exercises": rejected_exercises}
+    return {"session_id": session_id, "rejected_exercises": rejected_exercises}
+
+@app.post("/program-weeks")
+def create_program_week(program_week: ProgramWeekInput): 
+    existing = supabase.table("program_weeks").select("id") \
+        .eq("client_id", str(program_week.client_id)) \
+        .eq("block", program_week.block) \
+        .eq("week", program_week.week) \
+        .execute()
+
+    if existing.data:
+        return {"program_week_id": existing.data[0]["id"]}
+
+    result = supabase.table("program_weeks").insert({
+        "client_id": str(program_week.client_id),
+        "block": program_week.block,
+        "week": program_week.week,
+        "week_start_date": program_week.week_start_date.isoformat(),
+        "week_end_date": program_week.week_end_date.isoformat(),
+    }).execute()
+
+    return {"program_week_id": result.data[0]["id"]}
 
     
