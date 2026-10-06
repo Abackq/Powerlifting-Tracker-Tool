@@ -3,10 +3,16 @@ import re
 import time
 from datetime import datetime, date
 from datetime import timedelta
+import requests
+API_URL = "http://127.0.0.1:8000"
 
 WEEK_PATTERN = re.compile(r"^(?:Week\s+(\d+)|Meet\s+Week)$", re.IGNORECASE)
 DAY_PATTERN = re.compile(r"Day\s+(\d+)$", re.IGNORECASE)
 DATE_FORMATS = ["%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%B %d, %Y"]
+SETS_REPS_PATTERN = re.compile(r"^(\d+)\s*x\s*(\d+)(?:\s*-\s*\d+)?$", re.IGNORECASE)
+
+class UnloggedSet(Exception):
+    """Row has no logged load: a prescribed set the client hasn't filled in."""
 
 # def print_sheet_grid(workbook, sheet_name: str):
 #     """Prints every non-empty cell's row, column, and value for a given sheet.
@@ -196,17 +202,18 @@ def extract_all_exercises(workbook, all_blocks: list[dict], client_id) -> list[d
 
 # region Stage 4: Validation
 def split_prescribed_value(prescribed_raw) -> dict:
-    """Splits the ambiguous prescribed column into either a top-set RPE
-    or a backdown percentage, based on sign.
-    Raises ValueError if prescribed_raw is present but not numeric."""
+    """Splits the ambiguous prescribed column into a top-set RPE or a backdown %, based on sign.
+    Raises ValueError if the value is present but not numeric."""
     if prescribed_raw is None:
         return {"prescribed_rpe": None, "prescribed_backoff_pct": None, "set_type": None}
+    if isinstance(prescribed_raw, datetime):
+        # Excel-corrupted RPE range like '6/7'. Not stored, but it's still a non-backdown set.
+        return {"prescribed_rpe": None, "prescribed_backoff_pct": None, "set_type": "top"}
     if not isinstance(prescribed_raw, (int, float)):
         raise ValueError(f"prescribed value is not numeric: {prescribed_raw!r}")
     if prescribed_raw >= 0:
         return {"prescribed_rpe": prescribed_raw, "prescribed_backoff_pct": None, "set_type": "top"}
-    else:
-        return {"prescribed_rpe": None, "prescribed_backoff_pct": abs(prescribed_raw) * 100, "set_type": "backdown"}
+    return {"prescribed_rpe": None, "prescribed_backoff_pct": abs(prescribed_raw) * 100, "set_type": "backdown"}
 
 def validate_numeric_field(value, field_name: str) -> float:
     """Confirms a value (actual_load_raw or actual_rpe_raw) is numeric.
@@ -217,11 +224,18 @@ def validate_numeric_field(value, field_name: str) -> float:
 
 def process_exercise_row(raw_row: dict) -> dict:
     """Takes a raw extracted row and returns a clean, validated record.
-    Raises ValueError if any field fails validation — the caller is
-    responsible for catching this and routing to ingestion_rejects."""
+    Raises ValueError if any field fails validation, and the caller
+    routes it to the rejects list."""
+
+    if raw_row["actual_load_raw"] is None:
+        raise UnloggedSet()
+
     prescribed = split_prescribed_value(raw_row["prescribed_raw"])
-    actual_load = validate_numeric_field(raw_row["actual_load_raw"], "actual_load")
-    actual_rpe = validate_numeric_field(raw_row["actual_rpe_raw"], "actual_rpe")
+    actual_load, load_note = numeric_or_note(raw_row["actual_load_raw"], "load")
+    actual_rpe, rpe_note = numeric_or_note((normalize_rpe(raw_row["actual_rpe_raw"])), "rpe")
+    num_sets, reps = parse_sets_x_reps(raw_row["sets_x_reps"])
+
+    notes = " | ".join(str(n) for n in [raw_row["notes"], load_note, rpe_note] if n) or None
 
     return {
         "client_id": raw_row["client_id"],
@@ -229,13 +243,14 @@ def process_exercise_row(raw_row: dict) -> dict:
         "week_number": raw_row["week_number"],
         "day_number": raw_row["day_number"],
         "exercise_name": raw_row["exercise_name"],
-        "sets_x_reps": raw_row["sets_x_reps"],
+        "num_sets": num_sets,
+        "reps": reps,
         "set_type": prescribed["set_type"],
         "prescribed_rpe": prescribed["prescribed_rpe"],
         "prescribed_backoff_pct": prescribed["prescribed_backoff_pct"],
         "actual_load": actual_load,
         "actual_rpe": actual_rpe,
-        "notes": raw_row["notes"],
+        "notes": notes,
     }
 
 def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -243,11 +258,13 @@ def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict]]
     Returns (clean_records, rejected_records)."""
     clean_records = []
     rejected_records = []
+    unlogged_records = []
 
     for raw_row in raw_rows:
         try:
-            clean = process_exercise_row(raw_row)
-            clean_records.append(clean)
+            clean_records.append(process_exercise_row(raw_row))
+        except UnloggedSet:
+            unlogged_records.append(raw_row)
         except ValueError as e:
             rejected_records.append({
                 "client_id": raw_row["client_id"],
@@ -258,6 +275,24 @@ def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict]]
             })
 
     return clean_records, rejected_records
+
+def normalize_rpe(value):
+    """Excel turns RPE ranges like '6/7' into dates (June 7).
+    Converts them back, keeping the highest number of the range."""
+    if isinstance(value, datetime):
+        highest = max(value.month, value.day)
+        if highest <= 10:   # only trust it if it's a plausible RPE
+            return float(highest)
+    return value
+
+def numeric_or_note(value, field_name: str):
+    """Returns (number, None) if value is numeric, (None, None) if blank,
+    or (None, note) if it's text we can't read. The raw text goes to notes."""
+    if value is None:
+        return None, None
+    if isinstance(value, (int, float)):
+        return value, None
+    return None, f"{field_name} (unreadable): {value}"
 
 # endregion Stage 4: Validation
 
@@ -320,8 +355,102 @@ def compute_week_date_ranges(all_blocks: list[dict]) -> None:
 
 # endregion Stage 5: Date Derivation
 
+#region Stage 6: API Payloads
+def build_session_payloads(clean_records: list[dict], program_week_ids: dict) -> list[dict]:
+    """Groups flat clean records into nested sessions for POST /sessions/batch.
+    program_week_ids maps (block_number, week_number) -> program_week_id."""
+    sessions = {}  # (client_id, block, week, day) -> session payload
+
+    for record in clean_records:
+        key = (record["client_id"], record["block_number"], record["week_number"], record["day_number"])
+
+        if key not in sessions:
+            week_key = (record["block_number"], record["week_number"])
+            if week_key not in program_week_ids:
+                raise ValueError(f"no program_week_id for block/week {week_key}")
+            sessions[key] = {
+                "client_id": record["client_id"],
+                "program_week_id": program_week_ids[week_key],
+                "day_number": record["day_number"],
+                "exercises": {},
+            }
+
+        exercises = sessions[key]["exercises"]
+        name = record["exercise_name"].strip()
+        if name.lower() not in exercises:
+            exercises[name.lower()] = {"exercise_name": name, "sets": []}
+
+        for new_set in expand_sets(record):
+            new_set["set_number"] = len(exercises[name.lower()]["sets"]) + 1
+            exercises[name.lower()]["sets"].append(new_set)
+
+    payloads = []
+    for session in sessions.values():
+        exercise_list = list(session["exercises"].values())
+        for exercise in exercise_list:
+            has_backdown = any(s["set_type"] == "backdown" for s in exercise["sets"])
+            if not has_backdown:
+                for s in exercise["sets"]:
+                    s["set_type"] = None
+        session["exercises"] = exercise_list
+        payloads.append(session)
+    return payloads
+
+def expand_sets(record: dict) -> list[dict]:
+    """The one place that decides how a row like '2x6' becomes sets.
+    Currently: num_sets identical sets, each with the row's load and RPE."""
+    return [
+        {
+            "reps": record["reps"],
+            "weight_value": record["actual_load"],
+            "weight_unit": None,
+            "rpe": record["actual_rpe"],
+            "set_type": record["set_type"],
+            "notes": record["notes"],
+        }
+        for _ in range(record["num_sets"])
+    ]
+
+def parse_sets_x_reps(value) -> tuple[int, int]:
+    """Splits '2x6' into (2, 6). Raises ValueError if it doesn't match."""
+    if not isinstance(value, str):
+        raise ValueError(f"sets_x_reps is not text: {value!r}")
+    match = SETS_REPS_PATTERN.match(value.strip())
+    if match is None:
+        raise ValueError(f"sets_x_reps not parseable: {value!r}")
+    return int(match.group(1)), int(match.group(2))
+
+def get_program_week_ids(all_blocks: list[dict], client_id: str) -> dict:
+    """Calls POST /program-weeks once per (block, week) and returns
+    {(block_number, week_number): program_week_id}."""
+    ids = {}
+    for block in all_blocks:
+        for week in block["weeks"]:
+            response = requests.post(f"{API_URL}/program-weeks", json={
+                "client_id": client_id,
+                "block": block["block_number"],
+                "week": week["week_number"],
+                "week_start_date": week["week_start_date"].isoformat(),
+                "week_end_date": week["week_end_date"].isoformat(),
+            })
+            response.raise_for_status()
+            ids[(block["block_number"], week["week_number"])] = response.json()["program_week_id"]
+    return ids
+
+def send_payloads(payloads: list[dict], chunk_size: int = 10) -> list[dict]:
+    """Posts sessions to /sessions/batch in chunks and returns every per-session result."""
+    results = []
+    for i in range(0, len(payloads), chunk_size):
+        chunk = payloads[i:i + chunk_size]
+        response = requests.post(f"{API_URL}/sessions/batch", json={"sessions": chunk}, timeout=120)
+        response.raise_for_status()
+        results.extend(response.json()["results"])
+    return results
+
+# endregion Stage 6: API Payloads
+
 if __name__ == "__main__":
-    client_id = "paste-jons-actual-client-uuid-here"  # from the clients table in Supabase
+    client_id = "596ebec9-7621-43a4-b6e0-ec149cd11482"  # test client from the API tests
     wb = load_client_workbook("Jon Program.xlsx")
     all_blocks = build_all_blocks(wb)
     compute_block_start_dates(all_blocks, find_date_started(wb))
@@ -329,6 +458,37 @@ if __name__ == "__main__":
     raw_rows = extract_all_exercises(wb, all_blocks, client_id)
     clean, rejected = process_all_exercises(raw_rows)
     print(f"{len(clean)} clean, {len(rejected)} rejected")
+    for r in rejected[:5]:
+        print(r["rejection_reason"])
+
+    # placeholder ids, only to inspect the payload shape. Real ones come from POST /program-weeks.
+    week_ids = get_program_week_ids(all_blocks, client_id)
+    payloads = build_session_payloads(clean, week_ids)
+    print(len(week_ids))
+    print(len(payloads), "sessions")
+    print(payloads[0])
+    sets_rejects = [r for r in rejected if "sets_x_reps" in r["rejection_reason"]]
+    print(len(sets_rejects))   # should be 36
+    for r in sets_rejects[:10]:
+        print(r["rejection_reason"])
+    print(set(r["rejection_reason"] for r in sets_rejects))
+    for b in all_blocks:
+        print(b["block_number"], b["tab_name"], len(b["weeks"]))
+    from collections import Counter
+    print(Counter(r["rejection_reason"].split(":")[0] for r in rejected).most_common())
+    for field in ["actual_load", "actual_rpe", "prescribed value"]:
+        reasons = [r["rejection_reason"] for r in rejected if r["rejection_reason"].startswith(field)]
+        print(field, Counter(reasons).most_common(8))
+    load_blanks = [r for r in rejected if r["rejection_reason"] == "actual_load is not numeric: None"]
+    print(Counter(r["block_number"] for r in load_blanks).most_common())
+    # client_id = "paste-jons-actual-client-uuid-here"  # from the clients table in Supabase
+    # wb = load_client_workbook("Jon Program.xlsx")
+    # all_blocks = build_all_blocks(wb)
+    # compute_block_start_dates(all_blocks, find_date_started(wb))
+    # compute_week_date_ranges(all_blocks)
+    # raw_rows = extract_all_exercises(wb, all_blocks, client_id)
+    # clean, rejected = process_all_exercises(raw_rows)
+    # print(f"{len(clean)} clean, {len(rejected)} rejected")
     # wb = load_client_workbook("Jon Program.xlsx")
     # all_blocks = build_all_blocks(wb)
     # compute_block_start_dates(all_blocks, find_date_started(wb))

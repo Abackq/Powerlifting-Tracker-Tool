@@ -24,8 +24,8 @@ def health_check():
 class SetInput(BaseModel):
     set_number: int
     reps: int
-    weight_value: float
-    weight_unit: str
+    weight_value: float | None = None
+    weight_unit: str | None = None
     rpe: float | None = None
     set_type: str | None = None
     notes: str | None = None
@@ -49,12 +49,16 @@ class ProgramWeekInput(BaseModel):
     week_start_date: date
     week_end_date: date
 
+class SessionBatchInput(BaseModel):
+    sessions: list[SessionInput]
+
 def get_exercise_id(exercise_name: str) -> UUID | None:
     result = supabase.table("exercises").select("id").ilike("name", exercise_name.strip()).execute()
     if result.data:
         return result.data[0]["id"]
     return None
 
+#region sessions
 @app.post("/sessions")
 def create_session(session: SessionInput):
     if session.program_week_id is None:
@@ -88,16 +92,16 @@ def create_session(session: SessionInput):
             .eq("session_id", session_id) \
             .eq("exercise_id", exercise_id) \
             .execute()
-        
+
         if existing_se.data:
-            session_exercise_id = existing_se.data[0]["id"]
-        else:
-            se_result = supabase.table("session_exercises").insert({
-                "session_id": session_id,
-                "exercise_id": exercise_id,
-                "exercise_role": exercise.exercise_role
-            }).execute()
-            session_exercise_id = se_result.data[0]["id"]
+            continue  # this exercise was already written on an earlier run
+
+        se_result = supabase.table("session_exercises").insert({
+            "session_id": session_id,
+            "exercise_id": exercise_id,
+            "exercise_role": exercise.exercise_role,
+        }).execute()
+        session_exercise_id = se_result.data[0]["id"]
 
         for s in exercise.sets:
             supabase.table("training_log").insert({
@@ -113,6 +117,9 @@ def create_session(session: SessionInput):
 
     return {"session_id": session_id, "rejected_exercises": rejected_exercises}
 
+# endregion sessions
+
+#region program weeks
 @app.post("/program-weeks")
 def create_program_week(program_week: ProgramWeekInput): 
     existing = supabase.table("program_weeks").select("id") \
@@ -134,4 +141,21 @@ def create_program_week(program_week: ProgramWeekInput):
 
     return {"program_week_id": result.data[0]["id"]}
 
-    
+# endregion program weeks
+
+#region sessions/batch
+@app.post("/sessions/batch")
+def create_sessions_batch(batch: SessionBatchInput):
+    results = []
+    for session in batch.sessions:
+        try: 
+            result = create_session(session)
+            results.append({"status": "ok", **result})
+        except HTTPException as e:
+            results.append({"status": "error", "detail": e.detail})
+        except Exception as e:
+            results.append({"status": "error", "detail": str(e)})
+    return {"results": results}
+
+#endregion sessions/batch
+
