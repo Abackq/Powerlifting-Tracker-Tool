@@ -4,6 +4,8 @@ import time
 from datetime import datetime, date
 from datetime import timedelta
 import requests
+from collections import Counter
+
 API_URL = "http://127.0.0.1:8000"
 
 WEEK_PATTERN = re.compile(r"^(?:Week\s+(\d+)|Meet\s+Week)$", re.IGNORECASE)
@@ -13,15 +15,6 @@ SETS_REPS_PATTERN = re.compile(r"^(\d+)\s*x\s*(\d+)(?:\s*-\s*\d+)?$", re.IGNOREC
 
 class UnloggedSet(Exception):
     """Row has no logged load: a prescribed set the client hasn't filled in."""
-
-# def print_sheet_grid(workbook, sheet_name: str):
-#     """Prints every non-empty cell's row, column, and value for a given sheet.
-#     Useful for visually inspecting layout before writing detection logic."""
-#     sheet = workbook[sheet_name]
-#     for row in sheet.iter_rows():
-#         for cell in row:
-#             if cell.value is not None:
-#                 print(f"row={cell.row}, col={cell.column}, value={cell.value!r}")
 
 # region Stage 1: Loading
 def load_client_workbook(filepath: str):
@@ -253,7 +246,7 @@ def process_exercise_row(raw_row: dict) -> dict:
         "notes": notes,
     }
 
-def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict]]:
+def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
     """Processes every raw extracted row, separating successes from failures.
     Returns (clean_records, rejected_records)."""
     clean_records = []
@@ -274,7 +267,7 @@ def process_all_exercises(raw_rows: list[dict]) -> tuple[list[dict], list[dict]]
                 "rejection_reason": str(e)
             })
 
-    return clean_records, rejected_records
+    return clean_records, rejected_records, unlogged_records
 
 def normalize_rpe(value):
     """Excel turns RPE ranges like '6/7' into dates (June 7).
@@ -386,13 +379,7 @@ def build_session_payloads(clean_records: list[dict], program_week_ids: dict) ->
 
     payloads = []
     for session in sessions.values():
-        exercise_list = list(session["exercises"].values())
-        for exercise in exercise_list:
-            has_backdown = any(s["set_type"] == "backdown" for s in exercise["sets"])
-            if not has_backdown:
-                for s in exercise["sets"]:
-                    s["set_type"] = None
-        session["exercises"] = exercise_list
+        session["exercises"] = list(session["exercises"].values())
         payloads.append(session)
     return payloads
 
@@ -405,7 +392,7 @@ def expand_sets(record: dict) -> list[dict]:
             "weight_value": record["actual_load"],
             "weight_unit": None,
             "rpe": record["actual_rpe"],
-            "set_type": record["set_type"],
+            "set_type": None, # labels dropped for now; the CHECK constraint allows null
             "notes": record["notes"],
         }
         for _ in range(record["num_sets"])
@@ -445,137 +432,36 @@ def send_payloads(payloads: list[dict], chunk_size: int = 10) -> list[dict]:
         response = requests.post(f"{API_URL}/sessions/batch", json={"sessions": chunk}, timeout=120)
         response.raise_for_status()
         results.extend(response.json()["results"])
+        print(f"sent {min(i + chunk_size, len(payloads))}/{len(payloads)}") 
     return results
 
 # endregion Stage 6: API Payloads
 
 if __name__ == "__main__":
-    client_id = "596ebec9-7621-43a4-b6e0-ec149cd11482"  # test client from the API tests
+    client_id = "596ebec9-7621-43a4-b6e0-ec149cd11482"  # test client
     wb = load_client_workbook("Jon Program.xlsx")
     all_blocks = build_all_blocks(wb)
     compute_block_start_dates(all_blocks, find_date_started(wb))
     compute_week_date_ranges(all_blocks)
     raw_rows = extract_all_exercises(wb, all_blocks, client_id)
-    clean, rejected = process_all_exercises(raw_rows)
-    print(f"{len(clean)} clean, {len(rejected)} rejected")
-    for r in rejected[:5]:
-        print(r["rejection_reason"])
+    clean, rejected, unlogged = process_all_exercises(raw_rows)
+    print(f"{len(clean)} clean, {len(rejected)} rejected, {len(unlogged)} unlogged")
 
-    # placeholder ids, only to inspect the payload shape. Real ones come from POST /program-weeks.
     week_ids = get_program_week_ids(all_blocks, client_id)
     payloads = build_session_payloads(clean, week_ids)
-    print(len(week_ids))
-    print(len(payloads), "sessions")
-    print(payloads[0])
-    sets_rejects = [r for r in rejected if "sets_x_reps" in r["rejection_reason"]]
-    print(len(sets_rejects))   # should be 36
-    for r in sets_rejects[:10]:
-        print(r["rejection_reason"])
-    print(set(r["rejection_reason"] for r in sets_rejects))
-    for b in all_blocks:
-        print(b["block_number"], b["tab_name"], len(b["weeks"]))
-    from collections import Counter
-    print(Counter(r["rejection_reason"].split(":")[0] for r in rejected).most_common())
-    for field in ["actual_load", "actual_rpe", "prescribed value"]:
-        reasons = [r["rejection_reason"] for r in rejected if r["rejection_reason"].startswith(field)]
-        print(field, Counter(reasons).most_common(8))
-    load_blanks = [r for r in rejected if r["rejection_reason"] == "actual_load is not numeric: None"]
-    print(Counter(r["block_number"] for r in load_blanks).most_common())
-    # client_id = "paste-jons-actual-client-uuid-here"  # from the clients table in Supabase
-    # wb = load_client_workbook("Jon Program.xlsx")
-    # all_blocks = build_all_blocks(wb)
-    # compute_block_start_dates(all_blocks, find_date_started(wb))
-    # compute_week_date_ranges(all_blocks)
-    # raw_rows = extract_all_exercises(wb, all_blocks, client_id)
-    # clean, rejected = process_all_exercises(raw_rows)
-    # print(f"{len(clean)} clean, {len(rejected)} rejected")
-    # wb = load_client_workbook("Jon Program.xlsx")
-    # all_blocks = build_all_blocks(wb)
-    # compute_block_start_dates(all_blocks, find_date_started(wb))
-    # compute_week_date_ranges(all_blocks)
-    # raw_rows = extract_all_exercises(wb, all_blocks)
-    # clean, rejected = process_all_exercises(raw_rows)
-    # print(f"{len(clean)} clean, {len(rejected)} rejected")
-    # print(all_blocks[0]["weeks"][0])
-    # wb = load_client_workbook("Jon Program.xlsx")
-    # all_blocks = build_all_blocks(wb)
-    # print(all_blocks[8])
-    # wb = load_client_workbook("Jon Program.xlsx")
-    # all_blocks = build_all_blocks(wb)
-    # for block in all_blocks:
-    #     day_counts = [len(w["days"]) for w in block["weeks"]]
-    #     print(block["block_number"], block["tab_name"], day_counts)
+    print(len(payloads), "sessions built")
 
-    # find_short_weeks(all_blocks)
-    # compute_block_start_dates(all_blocks, find_date_started(wb))
-    # compute_day_dates(all_blocks)
-    # for block in all_blocks[:3]:
-    #     print(block["block_number"], block["tab_name"], block["start_date"])
-    # print(all_blocks[0]["weeks"][0]["days"])
+    t0 = time.time()
+    results = send_payloads(payloads)   # small test first
+    print(f"{time.time() - t0:.0f}s total")
+    errors = [r for r in results if r["status"] == "error"]
+    rejected_ex = [e for r in results if r["status"] == "ok" for e in r["rejected_exercises"]]
+    print(len(results), "sent,", len(errors), "errors,", len(rejected_ex), "exercises rejected")
+    print(Counter(e["exercise_name"] for e in rejected_ex).most_common())
 
-    # wb = load_client_workbook("Jon Program.xlsx")
-    # print(find_date_started(wb))
+    for r in errors:
+        print(r["detail"])
 
-    # t0 = time.time()
-    # wb = load_client_workbook("Jon Program.xlsx")
-    # t1 = time.time()
-    # all_blocks = build_all_blocks(wb)
-    # t2 = time.time()
-    # raw_rows = extract_all_exercises(wb, all_blocks)
-    # t3 = time.time()
-    # clean, rejected = process_all_exercises(raw_rows)
-    # t4 = time.time()
-
-    # print(f"{len(clean)} clean, {len(rejected)} rejected")
-    # print(f"Load:      {t1 - t0:.2f}s")
-    # print(f"Structure: {t2 - t1:.2f}s")
-    # print(f"Extract:   {t3 - t2:.2f}s")
-    # print(f"Validate:  {t4 - t3:.2f}s")
-
-    # start = time.time()
-
-    # wb = load_client_workbook("Jon Program.xlsx")
-    # all_blocks = build_all_blocks(wb)
-    # raw_rows = extract_all_exercises(wb, all_blocks)
-    # clean, rejected = process_all_exercises(raw_rows)
-
-    # end = time.time()
-    # print(f"Clean records: {len(clean)}, Rejected records: {len(rejected)}")
-    # print(f"Processing time: {end - start:.2f} seconds")
-
-
-    # block_tabs = get_block_tabs(wb)
-    # sheet = wb[block_tabs[0]]
-    # week1 = find_week_columns(sheet)[0]
-    # week1["days"] = find_day_rows(sheet, week1)
-    # compute_day_ranges(sheet, week1)
-    # day1_exercises = extract_day_exercises(sheet, week1, week1["days"][0])
-    # for ex in day1_exercises:
-    #     print(ex)
-        
-    # block_tabs = get_block_tabs(wb)
-    # week1 = find_week_columns(wb[block_tabs[0]])[0]
-    # week1["days"] = find_day_rows(wb[block_tabs[0]], week1)
-    # compute_day_ranges(wb[block_tabs[0]], week1)
-    # print(week1["days"])
-
-    # all_blocks = build_all_blocks(wb)
-    # print(f"Found {len(all_blocks)} blocks")
-    # print(all_blocks[0])
-
-    # block_tabs = get_block_tabs(wb)
-    # weeks = find_week_columns(wb[block_tabs[0]])
-    # days = find_day_rows(wb[block_tabs[0]], weeks[0])
-    # weeks[0]["days"] = days
-    # compute_day_ranges(weeks[0])
-    # print(weeks[0]["days"])
-
-    # INDIVIDUAL FUNCTION TESTS
-    # -----------------------------------------------------------------------------
-    # block_tabs = get_block_tabs(wb)
-    # print(block_tabs)
-    # print_sheet_grid(wb, block_tabs[0]) # inspect the first block tab
-    # weeks = find_week_columns(wb[block_tabs[0]])
-    # days = find_day_rows(wb[block_tabs[0]], weeks[0])
-    # structure = build_week_day_structure(wb[block_tabs[0]])
+    expected = sum(len(e["sets"]) for s in payloads for e in s["exercises"])
+    print(expected, "sets expected")
     
