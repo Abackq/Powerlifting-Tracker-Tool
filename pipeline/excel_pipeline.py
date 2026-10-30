@@ -478,7 +478,7 @@ def send_payloads(payloads: list[dict], chunk_size: int = 10, max_failed_chunks:
 
 # endregion Stage 6: API Payloads
 
-DRY_RUN = True   # add this near the top of the file with your other constants
+DRY_RUN = False   # add this near the top of the file with your other constants
                  # True = parse and check only, writes nothing. False = real run.
 
 if __name__ == "__main__":
