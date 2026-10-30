@@ -29,6 +29,8 @@ class SetInput(BaseModel):
     rpe: float | None = None
     set_type: str | None = None
     notes: str | None = None
+    prescribed_rpe: float | None = None
+    prescribed_backoff_pct: float | None = None
 
 class ExerciseInput(BaseModel):
     exercise_name: str
@@ -82,40 +84,55 @@ def create_session(session: SessionInput):
         session_id = session_result.data[0]["id"]
 
     rejected_exercises = []
+    failed_exercises = []
+
     for exercise in session.exercises:
         exercise_id = get_exercise_id(exercise.exercise_name)
         if exercise_id is None:
             rejected_exercises.append({"exercise_name": exercise.exercise_name, "reason": "Exercise not found"})
             continue
 
-        existing_se = supabase.table("session_exercises").select("id") \
-            .eq("session_id", session_id) \
-            .eq("exercise_id", exercise_id) \
-            .execute()
+        try: 
+            existing_se = supabase.table("session_exercises").select("id") \
+                .eq("session_id", session_id) \
+                .eq("exercise_id", exercise_id) \
+                .execute()
 
-        if existing_se.data:
-            continue  # this exercise was already written on an earlier run
+            if existing_se.data:
+                session_exercise_id = existing_se.data[0]["id"] 
+                has_sets = supabase.table("training_log").select("id") \
+                    .eq("session_exercise_id", session_exercise_id) \
+                    .limit(1).execute()
+                if has_sets.data:
+                    continue
+            else:
+                se_result = supabase.table("session_exercises").insert({
+                    "session_id": session_id,
+                    "exercise_id": exercise_id,
+                    "exercise_role": exercise.exercise_role,
+                }).execute()
+                session_exercise_id = se_result.data[0]["id"]
 
-        se_result = supabase.table("session_exercises").insert({
-            "session_id": session_id,
-            "exercise_id": exercise_id,
-            "exercise_role": exercise.exercise_role,
-        }).execute()
-        session_exercise_id = se_result.data[0]["id"]
+            # one call for every set: all rows save, or none do
+            supabase.table("training_log").insert([
+                {
+                    "session_exercise_id": session_exercise_id,
+                    "set_number": s.set_number,
+                    "reps": s.reps,
+                    "weight_value": s.weight_value,
+                    "weight_unit": s.weight_unit,
+                    "rpe": s.rpe,
+                    "set_type": s.set_type,
+                    "notes": s.notes,
+                    "prescribed_rpe": s.prescribed_rpe,
+                    "prescribed_backoff_pct": s.prescribed_backoff_pct,
+                }
+                for s in exercise.sets
+            ]).execute()
+        except Exception as e:
+            failed_exercises.append({"exercise_name": exercise.exercise_name, "reason": str(e)})
 
-        for s in exercise.sets:
-            supabase.table("training_log").insert({
-                "session_exercise_id": session_exercise_id,
-                "set_number": s.set_number,
-                "reps": s.reps,
-                "weight_value": s.weight_value,
-                "weight_unit": s.weight_unit,
-                "rpe": s.rpe,
-                "set_type": s.set_type,
-                "notes": s.notes
-            }).execute()
-
-    return {"session_id": session_id, "rejected_exercises": rejected_exercises}
+    return {"session_id": session_id, "rejected_exercises": rejected_exercises, "failed_exercises": failed_exercises}
 
 # endregion sessions
 
