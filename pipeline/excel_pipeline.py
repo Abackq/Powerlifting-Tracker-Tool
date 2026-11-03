@@ -231,9 +231,6 @@ def process_exercise_row(raw_row: dict) -> dict:
     Raises ValueError if any field fails validation, and the caller
     routes it to the rejects list."""
 
-    if raw_row["actual_load_raw"] is None:
-        raise UnloggedSet()
-
     prescribed = split_prescribed_value(raw_row["prescribed_raw"])
     actual_load, load_note = numeric_or_note(raw_row["actual_load_raw"], "load")
     actual_rpe, rpe_note = rpe_or_note(normalize_rpe(raw_row["actual_rpe_raw"]))
@@ -485,7 +482,7 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         raise SystemExit("usage: python pipeline.py <client_id>")
     client_id = sys.argv[1]  
-    wb = load_client_workbook("Jon Program.xlsx")
+    wb = load_client_workbook("Jon_Program.xlsx")
     all_blocks = build_all_blocks(wb)
     compute_block_start_dates(all_blocks, find_date_started(wb))
     compute_week_date_ranges(all_blocks)
@@ -494,13 +491,29 @@ if __name__ == "__main__":
     print(f"{len(clean)} clean, {len(rejected)} rejected, {len(unlogged)} unlogged")
 
     if DRY_RUN:
-        print(Counter(r["prescribed_raw"].strftime("%m/%d")
-                for r in raw_rows
-                if isinstance(r["prescribed_raw"], datetime) and r["actual_load_raw"] is not None)) 
-        # What kind of value sits in the prescribed cell, for rows that have a logged load
-        print(sum(r["num_sets"] for r in clean if r["prescribed_rpe"] is not None), "sets should have a prescribed RPE")
-        print(Counter(type(r["prescribed_raw"]).__name__ for r in raw_rows if r["actual_load_raw"] is not None))
-        raise SystemExit   # stops here, before any API calls 
+        # 1. Alarm: comp-lift loads under 20 mean a misread column
+        tiny = Counter(r["block_number"] for r in clean
+                       if r["exercise_name"].strip().lower() in ("comp squat", "comp bench", "deadlift")
+                       and r["actual_load"] is not None and r["actual_load"] < 20)
+        print("tiny comp loads by block:", tiny)   # should be an empty Counter()
+
+        # 2. Spot check: block 13, week 1, day 3 deadlifts (expect 185, 160, 145 at RPE 5)
+        for r in clean:
+            if (r["block_number"], r["week_number"], r["day_number"], r["exercise_name"].strip()) == (13, 1, 3, "Deadlift"):
+                print(r["num_sets"], "x", r["reps"], "load:", r["actual_load"], "rpe:", r["actual_rpe"])
+
+        for r in rejected:
+            print(r["block_number"], r["week_number"], r["day_number"], r["rejection_reason"])
+
+        # Raw cells for the block 2 / week 3 / day 2 reject
+        for r in raw_rows:
+            if (r["block_number"], r["week_number"], r["day_number"]) == (2, 3, 2) and r["sets_x_reps"] is None:
+                print(r["exercise_name"], "| load:", r["actual_load_raw"], "| rpe:", r["actual_rpe_raw"],
+                    "| prescribed:", r["prescribed_raw"], "| notes:", r["notes"])
+
+        print(sum(r["num_sets"] for r in clean), "sets expected")
+
+        raise SystemExit   # stops here, before any API calls
 
     week_ids = get_program_week_ids(all_blocks, client_id)
     payloads = build_session_payloads(clean, week_ids)
