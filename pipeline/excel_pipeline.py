@@ -479,10 +479,10 @@ DRY_RUN = False   # add this near the top of the file with your other constants
                  # True = parse and check only, writes nothing. False = real run.
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: python pipeline.py <client_id>")
-    client_id = sys.argv[1]  
-    wb = load_client_workbook("Jon_Program.xlsx")
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: python excel_pipeline.py <client_id> <workbook_path>")
+    client_id, workbook_path = sys.argv[1], sys.argv[2]
+    wb = load_client_workbook(workbook_path)
     all_blocks = build_all_blocks(wb)
     compute_block_start_dates(all_blocks, find_date_started(wb))
     compute_week_date_ranges(all_blocks)
